@@ -11,16 +11,18 @@ from select_backbone import select_resnet, select_mousenet, select_simmousenet, 
 from convrnn import ConvGRU
 
 
-class DPC_RNN(nn.Module):
+class BP_RNN(nn.Module):
     '''DPC with RNN'''
-    def __init__(self, sample_size, num_seq=8, seq_len=5, pred_step=3, network='resnet50', hp='./SimMouseNet_hyperparams.yaml'):
-        super(DPC_RNN, self).__init__()
+    def __init__(self, sample_size, num_seq=8, seq_len=5, pred_step=3, network='resnet50', proj_size = 1024, lambd = 5e-3, hp='./SimMouseNet_hyperparams.yaml'):
+        super(BP_RNN, self).__init__()
         torch.cuda.manual_seed(233) #233
-        print('Using DPC-RNN model')
+        print('Using BP-RNN model')
         self.sample_size = sample_size
         self.num_seq = num_seq
         self.seq_len = seq_len
         self.pred_step = pred_step
+        self.proj_size = proj_size
+        self.lambd = lambd
         
         if network == 'vgg' or network == 'mousenet' or network == 'simmousenet' or network == 'monkeynet':
             self.last_duration = seq_len
@@ -66,6 +68,9 @@ class DPC_RNN(nn.Module):
                                 nn.ReLU(inplace=True),
                                 nn.Conv2d(self.param['feature_size'], self.param['feature_size'], kernel_size=1, padding=0)
                                 )
+        self.projector = nn.Linear(self.param['feature_size']*self.pred_step*self.last_size**2,self.proj_size,bias=False)
+        self.bn = nn.BatchNorm1d(self.proj_size)
+        
         self.mask = None
         self.relu = nn.ReLU(inplace=False)
         self._initialize_weights(self.agg)
@@ -106,25 +111,24 @@ class DPC_RNN(nn.Module):
         # pred: [B, pred_step, D, last_size, last_size]
         # GT: [B, N, D, last_size, last_size]
         N = self.pred_step
-        # dot product D dimension in pred-GT pair, get a 6d tensor. First 3 dims are from pred, last 3 dims are from GT. 
-        pred = pred.permute(0,1,3,4,2).contiguous().view(B*self.pred_step*self.last_size**2, self.param['feature_size'])
-        feature_inf = feature_inf.permute(0,1,3,4,2).contiguous().view(B*N*self.last_size**2, self.param['feature_size']).transpose(0,1)
-        score = torch.matmul(pred, feature_inf).view(B, self.pred_step, self.last_size**2, B, N, self.last_size**2)
+        pred = pred.contiguous().view(B, self.param['feature_size']*self.pred_step*self.last_size**2)
+        feature_inf = feature_inf.contiguous().view(B, self.param['feature_size']*self.pred_step*self.last_size**2)
+        pred = self.relu(self.bn(self.projector(pred))).transpose(0,1)
+        pred = (pred - pred.mean(0)) / pred.std(0) 
+        feature_inf = self.relu(self.bn(self.projector(feature_inf)))
+        feature_inf = (feature_inf - feature_inf.mean(0)) / feature_inf.std(0)
+#         pred = pred.permute(0,1,3,4,2).contiguous().view(B*self.pred_step*self.last_size**2, self.param['feature_size']).transpose(0,1)
+#         feature_inf = feature_inf.permute(0,1,3,4,2).contiguous().view(B*N*self.last_size**2, self.param['feature_size'])
+
+        c = torch.matmul(pred, feature_inf) / B
+        
+        on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+        off_diag = off_diagonal(c).pow_(2).sum()
+        loss = on_diag + self.lambd * off_diag
+
         del feature_inf, pred
 
-        if self.mask is None: # only compute mask once
-            # mask meaning: -2: omit, -1: temporal neg (hard), 0: easy neg, 1: pos, -3: spatial neg
-            mask = torch.zeros((B, self.pred_step, self.last_size**2, B, N, self.last_size**2), dtype=torch.int8, requires_grad=False).detach().cuda()
-            mask[torch.arange(B), :, :, torch.arange(B), :, :] = -3 # spatial neg
-            for k in range(B):
-                mask[k, :, torch.arange(self.last_size**2), k, :, torch.arange(self.last_size**2)] = -1 # temporal neg
-            tmp = mask.permute(0, 2, 1, 3, 5, 4).contiguous().view(B*self.last_size**2, self.pred_step, B*self.last_size**2, N)
-            for j in range(B*self.last_size**2):
-                tmp[j, torch.arange(self.pred_step), j, torch.arange(N-self.pred_step, N)] = 1 # pos
-            mask = tmp.view(B, self.last_size**2, self.pred_step, B, self.last_size**2, N).permute(0,2,1,3,5,4)
-            self.mask = mask
-
-        return [score, self.mask]
+        return loss
 
     def _initialize_weights(self, module):
         for name, param in module.named_parameters():
@@ -137,5 +141,21 @@ class DPC_RNN(nn.Module):
     def reset_mask(self):
         self.mask = None
     
-    
 
+def off_diagonal(x):
+# return a flattened view of the off-diagonal elements of a square matrix
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+if __name__ == "__main__":
+    
+    mydata = torch.FloatTensor(10, 8, 3, 5, 64, 64).to('cuda')
+    nn.init.normal_(mydata)
+    
+    model = BP_RNN(sample_size = 64, network = 'monkeynet').to('cuda')
+    
+    loss = model(mydata)
+    print(loss)
+    
+#     print(score.shape)

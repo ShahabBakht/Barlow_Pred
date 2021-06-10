@@ -30,7 +30,7 @@ torch.backends.cudnn.benchmark = False
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--net', default='resnet18', type=str)
-parser.add_argument('--model', default='dpc-rnn', type=str)
+parser.add_argument('--model', default='bp-rnn', type=str)
 parser.add_argument('--dataset', default='ucf101', type=str)
 parser.add_argument('--seq_len', default=5, type=int, help='number of frames in each video block')
 parser.add_argument('--num_seq', default=8, type=int, help='number of video blocks')
@@ -72,9 +72,9 @@ def main():
         cuda = torch.device('cpu')
     
 
-    ### dpc model ###
-    if args.model == 'dpc-rnn':
-        model = DPC_RNN(sample_size=args.img_dim, 
+    ### bp model ###
+    if args.model == 'bp-rnn':
+        model = BP_RNN(sample_size=args.img_dim, 
                         num_seq=args.num_seq, 
                         seq_len=args.seq_len, 
                         network=args.net, 
@@ -88,7 +88,7 @@ def main():
     global temperature; temperature = 1
     
     if args.wandb:
-        wandb.init(f"CPC {args.prefix}",config=args)
+        wandb.init(f"BP {args.prefix}",config=args)
         wandb.watch(model)
     
     ### optimizer ###
@@ -282,8 +282,6 @@ def process_output(mask):
 def train(data_loader, model, optimizer, epoch):
 
     losses = AverageMeter()
-    accuracy = AverageMeter()
-    accuracy_list = [AverageMeter(), AverageMeter(), AverageMeter()]
     model.train()
     global iteration
 
@@ -291,7 +289,7 @@ def train(data_loader, model, optimizer, epoch):
         tic = time.time()
         input_seq = input_seq.to(cuda)
         B = input_seq.size(0)
-        [score_, mask_] = model(input_seq)
+        loss = model(input_seq)
         # visualize
         if (iteration == 0) or (iteration == args.print_freq):
             if B > 2: input_seq = input_seq[0:2,:]
@@ -302,26 +300,26 @@ def train(data_loader, model, optimizer, epoch):
                                    iteration)
         del input_seq
         
-        if idx == 0: target_, (_, B2, NS, NP, SQ) = process_output(mask_)
+#         if idx == 0: target_, (_, B2, NS, NP, SQ) = process_output(mask_)
 
-        # score is a 6d tensor: [B, P, SQ, B, N, SQ]
-        score_flattened = score_.view(B*NP*SQ, B2*NS*SQ)
-        target_flattened = target_.view(B*NP*SQ, B2*NS*SQ)
-        target_flattened = target_flattened.double()
-        target_flattened = target_flattened.argmax(dim=1)
+#         # score is a 6d tensor: [B, P, SQ, B, N, SQ]
+#         score_flattened = score_.view(B*NP*SQ, B2*NS*SQ)
+#         target_flattened = target_.view(B*NP*SQ, B2*NS*SQ)
+#         target_flattened = target_flattened.double()
+#         target_flattened = target_flattened.argmax(dim=1)
 
-        score_flattened /= temperature
-        loss = criterion(score_flattened, target_flattened)
-        top1, top3, top5 = calc_topk_accuracy(score_flattened, target_flattened, (1,3,5))
+#         score_flattened /= temperature
+#         loss = criterion(score_flattened, target_flattened)
+#         top1, top3, top5 = calc_topk_accuracy(score_flattened, target_flattened, (1,3,5))
 
-        accuracy_list[0].update(top1.item(),  B)
-        accuracy_list[1].update(top3.item(), B)
-        accuracy_list[2].update(top5.item(), B)
+#         accuracy_list[0].update(top1.item(),  B)
+#         accuracy_list[1].update(top3.item(), B)
+#         accuracy_list[2].update(top5.item(), B)
 
-        losses.update(loss.item(), B)
-        accuracy.update(top1.item(), B)
+        losses.update(loss, B)
+#         accuracy.update(top1.item(), B)
 
-        del score_
+#         del score_
 
         optimizer.zero_grad()
 #         tic_backw = time.time()
@@ -333,52 +331,46 @@ def train(data_loader, model, optimizer, epoch):
 
         if idx % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
-                  'Loss {loss.val:.6f} ({loss.local_avg:.4f})\t'
-                  'Acc: top1 {3:.4f}; top3 {4:.4f}; top5 {5:.4f} T:{6:.2f}\t'.format(
-                   epoch, idx, len(data_loader), top1, top3, top5, time.time()-tic,loss=losses))
+                  'Loss {loss.val:.6f} ({loss.local_avg:.4f})\t'.format(
+                   epoch, idx, len(data_loader), time.time()-tic,loss=losses))
             writer_train.add_scalar('local/loss', losses.val, iteration)
-            writer_train.add_scalar('local/accuracy', accuracy.val, iteration)
-
             iteration += 1
 
-    return losses.local_avg, accuracy.local_avg, [i.local_avg for i in accuracy_list]
+    return losses.local_avg
 
 
 def validate(data_loader, model, epoch):
     losses = AverageMeter()
-    accuracy = AverageMeter()
-    accuracy_list = [AverageMeter(), AverageMeter(), AverageMeter()]
     model.eval()
 
     with torch.no_grad():
         for idx, input_seq in tqdm(enumerate(data_loader), total=len(data_loader)):
             input_seq = input_seq.to(cuda)
             B = input_seq.size(0)
-            [score_, mask_] = model(input_seq)
+            loss = model(input_seq)
             del input_seq
 
-            if idx == 0: target_, (_, B2, NS, NP, SQ) = process_output(mask_)
+#             if idx == 0: target_, (_, B2, NS, NP, SQ) = process_output(mask_)
 
             # [B, P, SQ, B, N, SQ]
-            score_flattened = score_.view(B*NP*SQ, B2*NS*SQ)
-            target_flattened = target_.view(B*NP*SQ, B2*NS*SQ)
-            target_flattened = target_flattened.double()
-            target_flattened = target_flattened.argmax(dim=1)
+#             score_flattened = score_.view(B*NP*SQ, B2*NS*SQ)
+#             target_flattened = target_.view(B*NP*SQ, B2*NS*SQ)
+#             target_flattened = target_flattened.double()
+#             target_flattened = target_flattened.argmax(dim=1)
 
-            loss = criterion(score_flattened, target_flattened)
-            top1, top3, top5 = calc_topk_accuracy(score_flattened, target_flattened, (1,3,5))
+#             loss = criterion(score_flattened, target_flattened)
+#             top1, top3, top5 = calc_topk_accuracy(score_flattened, target_flattened, (1,3,5))
 
             losses.update(loss.item(), B)
-            accuracy.update(top1.item(), B)
+#             accuracy.update(top1.item(), B)
 
-            accuracy_list[0].update(top1.item(),  B)
-            accuracy_list[1].update(top3.item(), B)
-            accuracy_list[2].update(top5.item(), B)
+#             accuracy_list[0].update(top1.item(),  B)
+#             accuracy_list[1].update(top3.item(), B)
+#             accuracy_list[2].update(top5.item(), B)
 
-    print('[{0}/{1}] Loss {loss.local_avg:.4f}\t'
-          'Acc: top1 {2:.4f}; top3 {3:.4f}; top5 {4:.4f} \t'.format(
-           epoch, args.epochs, *[i.avg for i in accuracy_list], loss=losses))
-    return losses.local_avg, accuracy.local_avg, [i.local_avg for i in accuracy_list]
+    print('[{0}/{1}] Loss {loss.local_avg:.4f}\t'.format(
+           epoch, args.epochs, loss=losses))
+    return losses.local_avg
 
 
 def get_data(transform, mode='train'):
