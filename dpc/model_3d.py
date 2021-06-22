@@ -69,7 +69,7 @@ class BP_RNN(nn.Module):
                                 nn.Conv2d(self.param['feature_size'], self.param['feature_size'], kernel_size=1, padding=0)
                                 )
         self.projector = nn.Linear(self.param['feature_size']*self.pred_step*self.last_size**2,self.proj_size,bias=False)
-        self.bn = nn.BatchNorm1d(self.proj_size)
+        self.bn = nn.BatchNorm1d(self.proj_size, affine=False)
         
         self.mask = None
         self.relu = nn.ReLU(inplace=False)
@@ -113,22 +113,21 @@ class BP_RNN(nn.Module):
         N = self.pred_step
         pred = pred.contiguous().view(B, self.param['feature_size']*self.pred_step*self.last_size**2)
         feature_inf = feature_inf.contiguous().view(B, self.param['feature_size']*self.pred_step*self.last_size**2)
-        pred = self.relu(self.bn(self.projector(pred))).transpose(0,1)
-        pred = (pred - pred.mean(0)) / pred.std(0) 
-        feature_inf = self.relu(self.bn(self.projector(feature_inf)))
-        feature_inf = (feature_inf - feature_inf.mean(0)) / feature_inf.std(0)
+        pred = (self.bn(self.projector(pred)))#.transpose(0,1)
+        feature_inf = (self.bn(self.projector(feature_inf)))
+#         print(f'std pred: {pred.std(0) }, std gt: {feature_inf.std(0)}')
 #         pred = pred.permute(0,1,3,4,2).contiguous().view(B*self.pred_step*self.last_size**2, self.param['feature_size']).transpose(0,1)
 #         feature_inf = feature_inf.permute(0,1,3,4,2).contiguous().view(B*N*self.last_size**2, self.param['feature_size'])
 
-        c = torch.matmul(pred, feature_inf) / B
+#         c = torch.matmul(pred, feature_inf) / B
         
-        on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-        off_diag = off_diagonal(c).pow_(2).sum()
-        loss = on_diag + self.lambd * off_diag
+#         on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+#         off_diag = off_diagonal(c).pow_(2).sum()
+#         loss = on_diag + self.lambd * off_diag
+#         del feature_inf, pred
 
-        del feature_inf, pred
-
-        return loss
+#         return loss, on_diag, off_diag
+        return pred, feature_inf
 
     def _initialize_weights(self, module):
         for name, param in module.named_parameters():
@@ -141,12 +140,6 @@ class BP_RNN(nn.Module):
     def reset_mask(self):
         self.mask = None
     
-
-def off_diagonal(x):
-# return a flattened view of the off-diagonal elements of a square matrix
-    n, m = x.shape
-    assert n == m
-    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 if __name__ == "__main__":
     

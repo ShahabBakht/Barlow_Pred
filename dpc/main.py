@@ -14,6 +14,7 @@ plt.switch_backend('agg')
 sys.path.append('../utils')
 from dataset_3d import *
 from model_3d import *
+from objective import *
 from resnet_2d3d import neq_load_customized
 from augmentation import *
 from utils import AverageMeter, save_checkpoint, denorm, calc_topk_accuracy
@@ -35,6 +36,8 @@ parser.add_argument('--dataset', default='ucf101', type=str)
 parser.add_argument('--seq_len', default=5, type=int, help='number of frames in each video block')
 parser.add_argument('--num_seq', default=8, type=int, help='number of video blocks')
 parser.add_argument('--pred_step', default=3, type=int)
+parser.add_argument('--proj_size', default=1024, type=int)
+parser.add_argument('--lambd', default=5e-3, type=float)
 parser.add_argument('--ds', default=3, type=int, help='frame downsampling rate')
 parser.add_argument('--batch_size', default=4, type=int)
 parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
@@ -64,7 +67,6 @@ def main():
     
     
     # global cuda; cuda = torch.device('cuda') # uncomment this if only gpu
-    # added by Shahab
     global cuda
     if torch.cuda.is_available():
         cuda = torch.device('cuda')
@@ -79,12 +81,14 @@ def main():
                         seq_len=args.seq_len, 
                         network=args.net, 
                         pred_step=args.pred_step,
+                        proj_size = args.proj_size,
+                        lambd = args.lambd,
                         hp = args.hyperparameter_file)
     else: raise ValueError('wrong model!')
 
     model = nn.DataParallel(model)
     model = model.to(cuda)
-    global criterion; criterion = nn.CrossEntropyLoss()
+    global criterion; criterion = BarlowTwinsLoss(lambd = args.lambd)
     global temperature; temperature = 1
     
     if args.wandb:
@@ -112,7 +116,7 @@ def main():
     
     args.old_lr = None
 
-    best_acc = 0
+    best_loss = 1e10
     global iteration; iteration = 0
 
     ### restart training ###
@@ -129,7 +133,7 @@ def main():
             checkpoint = torch.load(args.resume, map_location=torch.device('cpu'))
             args.start_epoch = checkpoint['epoch']
             iteration = checkpoint['iteration']
-            best_acc = checkpoint['best_acc']
+            best_loss = checkpoint['best_loss']
             model.load_state_dict(checkpoint['state_dict'])
             if not args.reset_lr: # if didn't reset lr, load old optimizer
                 optimizer.load_state_dict(checkpoint['optimizer'])
@@ -221,33 +225,28 @@ def main():
         # else:
         #     scheduler.step()
             
-        train_loss, train_acc, train_accuracy_list = train(train_loader, model, optimizer, epoch)
+        train_loss, train_on_diag, train_off_diag = train(train_loader, model, optimizer, epoch)
         
-        val_loss, val_acc, val_accuracy_list = validate(val_loader, model, epoch)
+        val_loss, val_on_diag, val_off_diag = validate(val_loader, model, epoch)
         
         wandb.log({"epoch": epoch, 
                    "train loss": train_loss,
-                   "train accuracy top1":train_accuracy_list[0], 
+                   "train on_diag": train_on_diag,
+                   "train off_diag": train_off_diag,
                    "val loss": val_loss,
-                   "val accuracy top1": val_accuracy_list[0]})
+                   "val on_diag": val_on_diag,
+                   "val off_diag": val_off_diag})
         
         # save curve
         writer_train.add_scalar('global/loss', train_loss, epoch)
-        writer_train.add_scalar('global/accuracy', train_acc, epoch)
         writer_val.add_scalar('global/loss', val_loss, epoch)
-        writer_val.add_scalar('global/accuracy', val_acc, epoch)
-        writer_train.add_scalar('accuracy/top1', train_accuracy_list[0], epoch)
-        writer_train.add_scalar('accuracy/top3', train_accuracy_list[1], epoch)
-        writer_train.add_scalar('accuracy/top5', train_accuracy_list[2], epoch)
-        writer_val.add_scalar('accuracy/top1', val_accuracy_list[0], epoch)
-        writer_val.add_scalar('accuracy/top3', val_accuracy_list[1], epoch)
-        writer_val.add_scalar('accuracy/top5', val_accuracy_list[2], epoch)
+        
 #         for name, param in model.named_parameters():
 #             if ('bn' not in name) and (param.requires_grad) and ("bias" not in name):            
 #                 writer_train.add_scalar(name, param.grad.abs().mean(), epoch)#.abs()
 
         # save check_point
-        is_best = val_acc > best_acc; best_acc = max(val_acc, best_acc)
+        is_best = val_loss < best_loss; best_loss = min(val_loss, best_loss)
         if epoch%save_checkpoint_freq == 0:
             save_this = True
         else:
@@ -256,14 +255,14 @@ def main():
         save_checkpoint({'epoch': epoch+1,
                          'net': args.net,
                          'state_dict': model.state_dict(),
-                         'best_acc': best_acc,
+                         'best_loss': best_loss,
                          'optimizer': optimizer.state_dict(),
                          'iteration': iteration}, 
                          is_best, filename=os.path.join(model_path, 'epoch%s.pth.tar' % str(epoch+1)), keep_all=save_this)
         save_checkpoint({'epoch': epoch+1,
                          'net': args.net,
                          'state_dict': model.state_dict(),
-                         'best_acc': best_acc,
+                         'best_loss': best_loss,
                          'optimizer': optimizer.state_dict(),
                          'iteration': iteration}, 
                          is_best, filename=os.path.join(model_path, 'last.pth.tar'), keep_all=save_this)
@@ -282,6 +281,9 @@ def process_output(mask):
 def train(data_loader, model, optimizer, epoch):
 
     losses = AverageMeter()
+    on_diags = AverageMeter()
+    off_diags = AverageMeter()
+    
     model.train()
     global iteration
 
@@ -289,7 +291,10 @@ def train(data_loader, model, optimizer, epoch):
         tic = time.time()
         input_seq = input_seq.to(cuda)
         B = input_seq.size(0)
-        loss = model(input_seq)
+#         loss, on_diag, off_diag = model(input_seq)
+        pred, gt = model(input_seq)
+        loss, on_diag, off_diag = criterion(pred, gt)
+        
         # visualize
         if (iteration == 0) or (iteration == args.print_freq):
             if B > 2: input_seq = input_seq[0:2,:]
@@ -316,7 +321,9 @@ def train(data_loader, model, optimizer, epoch):
 #         accuracy_list[1].update(top3.item(), B)
 #         accuracy_list[2].update(top5.item(), B)
 
-        losses.update(loss, B)
+        losses.update(loss.item(), B)
+        on_diags.update(on_diag.item(), B)
+        off_diags.update(off_diag.item(), B)
 #         accuracy.update(top1.item(), B)
 
 #         del score_
@@ -327,27 +334,34 @@ def train(data_loader, model, optimizer, epoch):
 #         toc_backw = time.time()
         optimizer.step()
 
-        del loss
+        del loss, on_diag, off_diag
 
         if idx % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
-                  'Loss {loss.val:.6f} ({loss.local_avg:.4f})\t'.format(
-                   epoch, idx, len(data_loader), time.time()-tic,loss=losses))
+                  'Loss {loss.val:.6f} ({loss.local_avg:.4f})\t'
+                  'On diag {on_diag.val:.6f} ({on_diag.local_avg:.4f})\t'
+                  'Off diag {off_diag.val:.6f} ({off_diag.local_avg:.4f})\t'.format(
+                   epoch, idx, len(data_loader), time.time()-tic,loss=losses, on_diag=on_diags, off_diag=off_diags))
             writer_train.add_scalar('local/loss', losses.val, iteration)
             iteration += 1
 
-    return losses.local_avg
+    return losses.local_avg, on_diags.local_avg, off_diags.local_avg
 
 
 def validate(data_loader, model, epoch):
     losses = AverageMeter()
+    on_diags = AverageMeter()
+    off_diags = AverageMeter()
     model.eval()
 
     with torch.no_grad():
         for idx, input_seq in tqdm(enumerate(data_loader), total=len(data_loader)):
             input_seq = input_seq.to(cuda)
             B = input_seq.size(0)
-            loss = model(input_seq)
+#             loss, on_diag, off_diag = model(input_seq)
+            pred, gt = model(input_seq)
+            loss, on_diag, off_diag = criterion(pred, gt)
+        
             del input_seq
 
 #             if idx == 0: target_, (_, B2, NS, NP, SQ) = process_output(mask_)
@@ -362,15 +376,19 @@ def validate(data_loader, model, epoch):
 #             top1, top3, top5 = calc_topk_accuracy(score_flattened, target_flattened, (1,3,5))
 
             losses.update(loss.item(), B)
+            on_diags.update(on_diag.item(), B)
+            off_diags.update(off_diag.item(), B)
 #             accuracy.update(top1.item(), B)
 
 #             accuracy_list[0].update(top1.item(),  B)
 #             accuracy_list[1].update(top3.item(), B)
 #             accuracy_list[2].update(top5.item(), B)
 
-    print('[{0}/{1}] Loss {loss.local_avg:.4f}\t'.format(
-           epoch, args.epochs, loss=losses))
-    return losses.local_avg
+    print('[{0}/{1}] Loss {loss.local_avg:.4f}\t'
+          'On diag {on_diag.local_avg:.4f}\t'
+          'Off diag {off_diag.local_avg:.4f}\t'.format(
+           epoch, args.epochs, loss=losses, on_diag=on_diags, off_diag=off_diags))
+    return losses.local_avg, on_diags.local_avg, off_diags.local_avg
 
 
 def get_data(transform, mode='train'):
